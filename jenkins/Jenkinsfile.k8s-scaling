@@ -1,0 +1,463 @@
+/*
+ * DevOps-KillSwitch-Scaling (downstream job)
+ * ------------------------------------------
+ * Parallel scale down / scale up / rollout restart of production workloads
+ * spread across multiple GKE clusters:
+ *
+ *   Celery workers      -> KEDA ScaledObjects   (cluster: prod-celery)
+ *   Message-Persister   -> Kruise StatefulSets  (cluster: prod-mp)
+ *   Request-Handler     -> Deployment + KEDA    (cluster: prod-request-handler)
+ *
+ * Every SCALE_DOWN backs up the current autoscaling limits first, and every
+ * SCALE_UP restores from that backup, so the platform returns to exactly
+ * the shape it had before the incident.
+ */
+
+// Shell prelude shared by every stage: authenticate and point kubectl at the
+// right cluster + namespace. Each stage runs in its own throwaway container,
+// so each one logs in for itself instead of relying on state from another stage.
+def gkeLogin(String cluster, String namespace) {
+    return """#!/bin/bash
+set -eo pipefail
+echo "Authenticating to GKE (cluster=${cluster}, namespace=${namespace})"
+gcloud auth activate-service-account --key-file="\$SECRET_FILE_PATH"
+gcloud container clusters get-credentials ${cluster} --zone "\$GKE_ZONE" --project "\$GCP_PROJECT"
+kubectl config set-context --current --namespace=${namespace}
+"""
+}
+
+pipeline {
+    agent {
+        label 'gcp-build'
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    environment {
+        GCP_PROJECT            = 'my-gcp-project'
+        GKE_ZONE               = 'asia-south1-a'
+        GCP_CRED_ID            = 'GCP-PROD-DEPLOYMENT'
+        BUILD_IMAGE            = 'devops-build:latest'
+
+        CELERY_CLUSTER         = 'prod-celery'
+        MP_CLUSTER             = 'prod-mp'
+        RH_CLUSTER             = 'prod-request-handler'
+
+        CELERY_NAMESPACE       = 'celery'
+        MP_NAMESPACE           = 'message-persister'
+        RH_NAMESPACE           = 'request-handler'
+        RH_DEPLOYMENT_NAME     = 'request-handler'
+        RH_SCALED_OBJECT       = 'request-handler-scaler'
+
+        // Incident-time limits for Request-Handler and replicas for MP scale-up.
+        // Tune these to your platform.
+        RH_DOWN_MIN_REPLICAS   = '1'
+        RH_DOWN_MAX_REPLICAS   = '1'
+        MP_UP_REPLICAS         = '100'
+
+        // Host directory holding backup / csv / template files. Mounted into
+        // every build container so backups survive between job runs.
+        SCALING_JOB_DIR        = '/home/ubuntu/scaling_job'
+        BACKUP_FILE            = 'celeryscaledobjectminmax.txt'
+        RH_BACKUP_FILE         = 'reqhandscaledobjectminmax.txt'
+
+        // Allowlist: only these Celery scalers are ever touched.
+        CELERY_SCALERS = '''celery-agent-msgs-worker-scaler
+celery-auto-reply-worker-scaler
+celery-default-campaign-stats-worker-scaler
+celery-default-worker-scaler
+celery-future-worker-scaler
+celery-high-priority-stats-worker-scaler
+celery-high-worker-scaler
+celery-instagram-worker-scaler
+celery-long-running-worker-scaler
+celery-mqtt-worker-scaler
+celery-notifications-worker-scaler
+celery-ogc-immediate-worker-scaler
+celery-ogc-priority-new-1-worker-scaler
+celery-ogc-priority-worker-scaler
+celery-ogc-scheduled-worker-scaler
+celery-otc-priority-worker-scaler'''
+    }
+
+    parameters {
+        booleanParam(
+            defaultValue: false,
+            description: 'Operate on GKE Celery',
+            name: 'GKE_CELERY'
+        )
+        booleanParam(
+            defaultValue: false,
+            description: 'Scaling of RH',
+            name: 'GKE_SCALING_RH'
+        )
+        booleanParam(
+            defaultValue: false,
+            description: 'Operate on GCP MP',
+            name: 'GCP_MP'
+        )
+        booleanParam(
+            defaultValue: false,
+            description: 'RolloutRestart RH',
+            name: 'GKE_ROLLOUT_RH'
+        )
+        choice(
+            name: 'SCALE_ACTION',
+            choices: ['SCALE_DOWN', 'SCALE_UP'],
+            description: 'Scale action'
+        )
+    }
+
+    stages {
+
+        stage('Scaling Operations') {
+            parallel {
+
+                /* ===================== SCALE DOWN CELERY ===================== */
+
+                stage('GKE | Backup KEDA min/max & Scale Down CELERY') {
+                    when {
+                        beforeAgent true
+                        allOf {
+                            expression { params.GKE_CELERY }
+                            expression { params.SCALE_ACTION == 'SCALE_DOWN' }
+                        }
+                    }
+                    agent {
+                        docker {
+                            image "${BUILD_IMAGE}"
+                            args "-u root -v ${SCALING_JOB_DIR}:${SCALING_JOB_DIR}"
+                            label 'gcp-build'
+                            reuseNode true
+                        }
+                    }
+                    steps {
+                        withCredentials([file(credentialsId: env.GCP_CRED_ID, variable: 'SECRET_FILE_PATH')]) {
+                            sh(gkeLogin(env.CELERY_CLUSTER, env.CELERY_NAMESPACE) + '''
+                            echo "Backing up KEDA ScaledObject min/max replicas (allowlisted only)"
+
+                            BACKUP_PATH="$SCALING_JOB_DIR/$BACKUP_FILE"
+                            TMP_BACKUP="$(mktemp)"
+
+                            # Loop over the allowlist (one name per line), not over the whole cluster
+                            for sc in $CELERY_SCALERS; do
+                                if ! kubectl get scaledobject "$sc" >/dev/null 2>&1; then
+                                    echo "SKIP  $sc (not found in cluster)"
+                                    continue
+                                fi
+
+                                MIN=$(kubectl get scaledobject "$sc" -o jsonpath='{.spec.minReplicaCount}')
+                                MAX=$(kubectl get scaledobject "$sc" -o jsonpath='{.spec.maxReplicaCount}')
+
+                                echo "$sc min=$MIN max=$MAX" >> "$TMP_BACKUP"
+                                echo "SAVED $sc -> min=$MIN max=$MAX"
+                            done
+
+                            # Never overwrite a good backup with an empty one. If SCALE_DOWN
+                            # is run twice, the ScaledObjects are already gone, and the
+                            # first backup is the only record of the original limits.
+                            if [ -s "$TMP_BACKUP" ]; then
+                                mv "$TMP_BACKUP" "$BACKUP_PATH"
+                            else
+                                echo "[WARN] Nothing captured - keeping existing backup at $BACKUP_PATH"
+                                rm -f "$TMP_BACKUP"
+                            fi
+
+                            echo "Backup file:"
+                            cat "$BACKUP_PATH"
+
+                            echo "Deleting ScaledObjects (stops KEDA from scaling the workers back up)"
+                            for sc in $(cut -d' ' -f1 "$BACKUP_PATH"); do
+                                kubectl delete scaledobject "$sc" --ignore-not-found
+                            done
+
+                            echo "Scaling Down Deployments"
+                            for sc in $(cut -d' ' -f1 "$BACKUP_PATH"); do
+                                dep="${sc%-scaler}"
+                                echo "SCALE0 $dep"
+                                kubectl scale --replicas=0 deploy "$dep"
+                            done
+
+                            echo "Force Terminating Pods"
+                            kubectl get pod | grep Terminating | awk '{print $1}' | xargs -r -I % kubectl delete pod % --force --grace-period=0 || true
+                            ''')
+                        }
+                    }
+                }
+
+                /* ===================== SCALE UP CELERY ===================== */
+
+                stage('GKE | Restore KEDA min/max CELERY (Scale Up)') {
+                    when {
+                        beforeAgent true
+                        allOf {
+                            expression { params.GKE_CELERY }
+                            expression { params.SCALE_ACTION == 'SCALE_UP' }
+                        }
+                    }
+                    agent {
+                        docker {
+                            image "${BUILD_IMAGE}"
+                            args "-u root -v ${SCALING_JOB_DIR}:${SCALING_JOB_DIR}"
+                            label 'gcp-build'
+                            reuseNode true
+                        }
+                    }
+                    steps {
+                        withCredentials([file(credentialsId: env.GCP_CRED_ID, variable: 'SECRET_FILE_PATH')]) {
+                            sh(gkeLogin(env.CELERY_CLUSTER, env.CELERY_NAMESPACE) + '''
+                            BACKUP_PATH="$SCALING_JOB_DIR/$BACKUP_FILE"
+                            CSV_FILE="$SCALING_JOB_DIR/celery_keda_config.csv"
+                            TEMPLATE="$SCALING_JOB_DIR/keda_celery.yaml"
+
+                            for f in "$BACKUP_PATH" "$CSV_FILE" "$TEMPLATE"; do
+                                if [ ! -f "$f" ]; then
+                                    echo "Required file not found: $f"
+                                    exit 1
+                                fi
+                            done
+
+                            echo "Reading backup file and restoring values"
+
+                            while IFS=',' read -r QUEUE WORKER SCALEUP_PERIOD SCALEUP_PERCENT QUEUE_LENGTH; do
+                                [ "$QUEUE" = "queue" ] && continue   # header row
+
+                                SCALER_NAME="celery-${WORKER}-worker-scaler"
+                                LINE=$(grep "^${SCALER_NAME} " "$BACKUP_PATH" || true)
+
+                                if [ -z "$LINE" ]; then
+                                    echo "No backup found for $SCALER_NAME - skipping"
+                                    continue
+                                fi
+
+                                MIN_REPLICA_COUNT=$(echo "$LINE" | awk -F'min=| max=' '{print $2}')
+                                MAX_REPLICA_COUNT=$(echo "$LINE" | awk -F'max=' '{print $2}')
+
+                                echo "Applying KEDA for $QUEUE"
+                                echo "min=$MIN_REPLICA_COUNT max=$MAX_REPLICA_COUNT period=$SCALEUP_PERIOD percent=$SCALEUP_PERCENT qlen=$QUEUE_LENGTH"
+
+                                sed "s/{{CELERY_QUEUE_NAME}}/${QUEUE}/g;s/{{CELERY_WORKER_NAME}}/${WORKER}/g;s/{{MIN_REPLICA_COUNT}}/${MIN_REPLICA_COUNT}/g;s/{{MAX_REPLICA_COUNT}}/${MAX_REPLICA_COUNT}/g;s/{{SCALEUP_PERIOD}}/${SCALEUP_PERIOD}/g;s/{{SCALEUP_PERCENT}}/${SCALEUP_PERCENT}/g;s/{{QUEUE_LENGTH}}/${QUEUE_LENGTH}/g" \
+                                    "$TEMPLATE" | kubectl apply -f -
+
+                            done < "$CSV_FILE"
+                            ''')
+                        }
+                    }
+                }
+
+                /* ===================== SCALE DOWN MP ===================== */
+
+                stage('GKE | Scaling Down MP') {
+                    when {
+                        beforeAgent true
+                        allOf {
+                            expression { params.GCP_MP }
+                            expression { params.SCALE_ACTION == 'SCALE_DOWN' }
+                        }
+                    }
+                    agent {
+                        docker {
+                            image "${BUILD_IMAGE}"
+                            args "-u root -v ${SCALING_JOB_DIR}:${SCALING_JOB_DIR}"
+                            label 'gcp-build'
+                            reuseNode true
+                        }
+                    }
+                    steps {
+                        withCredentials([file(credentialsId: env.GCP_CRED_ID, variable: 'SECRET_FILE_PATH')]) {
+                            sh(gkeLogin(env.MP_CLUSTER, env.MP_NAMESPACE) + '''
+                            echo "Listing Kruise StatefulSets"
+                            kubectl get statefulsets.apps.kruise.io
+
+                            echo "Scaling down MP"
+                            for sts in $(kubectl get statefulsets.apps.kruise.io -o name | grep 'message-persister'); do
+                                kubectl scale --replicas=0 "$sts"
+                            done
+
+                            echo "Checking all pods are down"
+                            kubectl get statefulsets.apps.kruise.io
+                            ''')
+                        }
+                    }
+                }
+
+                /* ===================== SCALE UP MP ===================== */
+
+                stage('GKE | Scaling Up MP') {
+                    when {
+                        beforeAgent true
+                        allOf {
+                            expression { params.GCP_MP }
+                            expression { params.SCALE_ACTION == 'SCALE_UP' }
+                        }
+                    }
+                    agent {
+                        docker {
+                            image "${BUILD_IMAGE}"
+                            args "-u root -v ${SCALING_JOB_DIR}:${SCALING_JOB_DIR}"
+                            label 'gcp-build'
+                            reuseNode true
+                        }
+                    }
+                    steps {
+                        withCredentials([file(credentialsId: env.GCP_CRED_ID, variable: 'SECRET_FILE_PATH')]) {
+                            sh(gkeLogin(env.MP_CLUSTER, env.MP_NAMESPACE) + '''
+                            echo "Listing Kruise StatefulSets"
+                            kubectl get statefulsets.apps.kruise.io
+
+                            echo "Scaling up MP to $MP_UP_REPLICAS replicas"
+                            for sts in $(kubectl get statefulsets.apps.kruise.io -o name | grep 'message-persister'); do
+                                kubectl scale --replicas="$MP_UP_REPLICAS" "$sts"
+                            done
+
+                            echo "Checking all pods are up"
+                            kubectl get statefulsets.apps.kruise.io
+                            ''')
+                        }
+                    }
+                }
+
+                /* ===================== SCALE DOWN RH ===================== */
+
+                stage('GKE | Scaling Down RH') {
+                    when {
+                        beforeAgent true
+                        allOf {
+                            expression { params.GKE_SCALING_RH }
+                            expression { params.SCALE_ACTION == 'SCALE_DOWN' }
+                        }
+                    }
+                    agent {
+                        docker {
+                            image "${BUILD_IMAGE}"
+                            args "-u root -v ${SCALING_JOB_DIR}:${SCALING_JOB_DIR}"
+                            label 'gcp-build'
+                            reuseNode true
+                        }
+                    }
+                    steps {
+                        withCredentials([file(credentialsId: env.GCP_CRED_ID, variable: 'SECRET_FILE_PATH')]) {
+                            sh(gkeLogin(env.RH_CLUSTER, env.RH_NAMESPACE) + '''
+                            BACKUP_PATH="$SCALING_JOB_DIR/$RH_BACKUP_FILE"
+
+                            echo "=== Fetching current min/max for ScaledObject: $RH_SCALED_OBJECT ==="
+                            MIN=$(kubectl get scaledobject "$RH_SCALED_OBJECT" -o jsonpath='{.spec.minReplicaCount}')
+                            MAX=$(kubectl get scaledobject "$RH_SCALED_OBJECT" -o jsonpath='{.spec.maxReplicaCount}')
+                            echo "Current values -> min=$MIN max=$MAX"
+
+                            # If RH is already at incident limits (job run twice), keep the
+                            # original backup instead of overwriting it with incident values.
+                            if [ "$MIN" = "$RH_DOWN_MIN_REPLICAS" ] && [ "$MAX" = "$RH_DOWN_MAX_REPLICAS" ] && [ -s "$BACKUP_PATH" ]; then
+                                echo "[WARN] Already scaled down - keeping existing backup"
+                            else
+                                echo "=== Backing up to $BACKUP_PATH ==="
+                                echo "$RH_SCALED_OBJECT deploy=$RH_DEPLOYMENT_NAME min=$MIN max=$MAX" > "$BACKUP_PATH"
+                            fi
+                            cat "$BACKUP_PATH"
+
+                            echo "=== Patching $RH_SCALED_OBJECT -> min=$RH_DOWN_MIN_REPLICAS max=$RH_DOWN_MAX_REPLICAS ==="
+                            kubectl patch scaledobject "$RH_SCALED_OBJECT" --type='json' -p="[
+                                {\\"op\\": \\"replace\\", \\"path\\": \\"/spec/minReplicaCount\\", \\"value\\": $RH_DOWN_MIN_REPLICAS},
+                                {\\"op\\": \\"replace\\", \\"path\\": \\"/spec/maxReplicaCount\\", \\"value\\": $RH_DOWN_MAX_REPLICAS}
+                            ]"
+
+                            echo "=== Scaling deployment $RH_DEPLOYMENT_NAME to $RH_DOWN_MIN_REPLICAS replicas ==="
+                            kubectl scale --replicas="$RH_DOWN_MIN_REPLICAS" deploy "$RH_DEPLOYMENT_NAME"
+
+                            echo "=== Final state ==="
+                            kubectl get scaledobject "$RH_SCALED_OBJECT"
+                            kubectl get deploy "$RH_DEPLOYMENT_NAME"
+                            ''')
+                        }
+                    }
+                }
+
+                /* ===================== SCALE UP RH ===================== */
+
+                stage('GKE | Scaling Up RH') {
+                    when {
+                        beforeAgent true
+                        allOf {
+                            expression { params.GKE_SCALING_RH }
+                            expression { params.SCALE_ACTION == 'SCALE_UP' }
+                        }
+                    }
+                    agent {
+                        docker {
+                            image "${BUILD_IMAGE}"
+                            args "-u root -v ${SCALING_JOB_DIR}:${SCALING_JOB_DIR}"
+                            label 'gcp-build'
+                            reuseNode true
+                        }
+                    }
+                    steps {
+                        withCredentials([file(credentialsId: env.GCP_CRED_ID, variable: 'SECRET_FILE_PATH')]) {
+                            sh(gkeLogin(env.RH_CLUSTER, env.RH_NAMESPACE) + '''
+                            BACKUP_PATH="$SCALING_JOB_DIR/$RH_BACKUP_FILE"
+
+                            echo "=== Restoring ScaledObject: $RH_SCALED_OBJECT from backup ==="
+                            if [ ! -f "$BACKUP_PATH" ]; then
+                                echo "ERROR: Backup file not found at $BACKUP_PATH"
+                                exit 1
+                            fi
+                            cat "$BACKUP_PATH"
+
+                            LINE=$(grep "^$RH_SCALED_OBJECT " "$BACKUP_PATH" || true)
+                            if [ -z "$LINE" ]; then
+                                echo "ERROR: No backup entry found for $RH_SCALED_OBJECT"
+                                exit 1
+                            fi
+
+                            MIN=$(echo "$LINE" | awk -F'min=| max=' '{print $2}')
+                            MAX=$(echo "$LINE" | awk -F'max=' '{print $2}')
+
+                            echo "Restoring $RH_SCALED_OBJECT -> min=$MIN max=$MAX"
+                            kubectl patch scaledobject "$RH_SCALED_OBJECT" --type='json' -p="[
+                                {\\"op\\": \\"replace\\", \\"path\\": \\"/spec/minReplicaCount\\", \\"value\\": $MIN},
+                                {\\"op\\": \\"replace\\", \\"path\\": \\"/spec/maxReplicaCount\\", \\"value\\": $MAX}
+                            ]"
+
+                            echo "=== Final state after restore ==="
+                            kubectl get scaledobject "$RH_SCALED_OBJECT"
+                            kubectl get deploy "$RH_DEPLOYMENT_NAME"
+                            ''')
+                        }
+                    }
+                }
+
+                /* ===================== ROLLOUT RESTART RH ===================== */
+
+                stage('GKE | Rolling Restart RH') {
+                    when {
+                        beforeAgent true
+                        expression { params.GKE_ROLLOUT_RH }
+                    }
+                    agent {
+                        docker {
+                            image "${BUILD_IMAGE}"
+                            args "-u root -v ${SCALING_JOB_DIR}:${SCALING_JOB_DIR}"
+                            label 'gcp-build'
+                            reuseNode true
+                        }
+                    }
+                    steps {
+                        withCredentials([file(credentialsId: env.GCP_CRED_ID, variable: 'SECRET_FILE_PATH')]) {
+                            sh(gkeLogin(env.RH_CLUSTER, env.RH_NAMESPACE) + '''
+                            echo "Rolling Restart RH"
+                            kubectl rollout restart deploy request-handler request-handler-monitoring
+                            ''')
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo 'DONE scaling'
+        }
+    }
+}

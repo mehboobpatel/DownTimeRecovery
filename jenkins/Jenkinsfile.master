@@ -1,0 +1,176 @@
+/*
+ * KillSwitch - Master Orchestrator
+ * ---------------------------------
+ * Single entry point for incident response during high traffic / downtime.
+ * Lets on-call engineers (DevOps, Platform or Developers) trigger, IN PARALLEL:
+ *   1. MongoDB long-running query identification / kill  -> Mongo-Prod-Queries-Kill
+ *   2. Kubernetes scale down / scale up / rollout restart -> DevOps-KillSwitch-Scaling
+ *
+ * Nothing runs unless it is explicitly ticked.
+ */
+
+pipeline {
+    agent {
+        label 'gcp-build'
+    }
+
+    options {
+        timeout(time: 45, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '50'))
+    }
+
+    environment {
+        MONGO_QUERY_KILL_JOB = 'Mongo-Prod-Queries-Kill'
+        SCALING_JOB          = 'DevOps-KillSwitch-Scaling'
+    }
+
+    parameters {
+
+        // ---------- Master switches ----------
+        booleanParam(
+            name: 'RUN_MONGO_QUERY_KILL',
+            defaultValue: false,
+            description: 'Trigger the Mongo Query Kill pipeline'
+        )
+
+        // ---------- Mongo Query Kill params ----------
+        choice(
+            name: 'CORE_DATABASE_NAME',
+            choices: ['MAIN', 'CHAT', 'EVENT', 'CHAT_MESSAGE'],
+            description: '[Mongo Query Kill] Select which MongoDB cluster to run against'
+        )
+        string(
+            name: 'SECONDS',
+            defaultValue: '10',
+            description: '[Mongo Query Kill] Kill queries running longer than this many seconds'
+        )
+        booleanParam(
+            name: 'DRY_RUN',
+            defaultValue: true,
+            description: '[Mongo Query Kill] If true, only IDENTIFY and list operations (nothing is killed)'
+        )
+        string(
+            name: 'DB_NAME',
+            defaultValue: '',
+            description: '[Mongo Query Kill] Optional: only kill ops for this DB name'
+        )
+
+        // ---------- Scaling params ----------
+        booleanParam(
+            name: 'GCP_CELERY',
+            defaultValue: false,
+            description: '[Scaling] Operate on Celery workers (KEDA ScaledObjects)'
+        )
+        booleanParam(
+            name: 'GCP_SCALING_RH',
+            defaultValue: false,
+            description: '[Scaling] Scale Request-Handler'
+        )
+        booleanParam(
+            name: 'GCP_MP',
+            defaultValue: false,
+            description: '[Scaling] Operate on Message-Persister (Kruise StatefulSets)'
+        )
+        booleanParam(
+            name: 'GCP_ROLLOUT_RH',
+            defaultValue: false,
+            description: '[Scaling] Rollout restart Request-Handler'
+        )
+        choice(
+            name: 'SCALE_ACTION',
+            choices: ['SCALE_DOWN', 'SCALE_UP'],
+            description: '[Scaling] Scale action'
+        )
+    }
+
+    stages {
+
+        stage('Validate Input') {
+            steps {
+                script {
+                    def scalingSelected = params.GCP_CELERY || params.GCP_SCALING_RH ||
+                                          params.GCP_MP || params.GCP_ROLLOUT_RH
+
+                    if (!params.RUN_MONGO_QUERY_KILL && !scalingSelected) {
+                        error("Nothing selected. Tick RUN_MONGO_QUERY_KILL and/or at least one of GCP_CELERY / GCP_SCALING_RH / GCP_MP / GCP_ROLLOUT_RH.")
+                    }
+
+                    // Guard the free-text inputs: the job is self-service, so
+                    // only accept a positive integer and a plain DB name.
+                    if (params.RUN_MONGO_QUERY_KILL) {
+                        if (!(params.SECONDS ==~ /^[1-9][0-9]*$/)) {
+                            error("SECONDS must be a positive integer, got '${params.SECONDS}'")
+                        }
+                        if (params.DB_NAME && !(params.DB_NAME ==~ /^[A-Za-z0-9_-]+$/)) {
+                            error("DB_NAME may only contain letters, digits, '_' and '-', got '${params.DB_NAME}'")
+                        }
+                    }
+
+                    if (params.GCP_ROLLOUT_RH && params.GCP_SCALING_RH) {
+                        echo "[WARN] Rollout restart and scaling of RH were both selected; they run in parallel."
+                    }
+
+                    echo "[INFO] RUN_MONGO_QUERY_KILL=${params.RUN_MONGO_QUERY_KILL}, DRY_RUN=${params.DRY_RUN}"
+                    echo "[INFO] Scaling selected=${scalingSelected}, SCALE_ACTION=${params.SCALE_ACTION}"
+                }
+            }
+        }
+
+        stage('Trigger Downstream Jobs') {
+            parallel {
+
+                stage('Mongo Query Kill') {
+                    when {
+                        beforeAgent true
+                        expression { params.RUN_MONGO_QUERY_KILL }
+                    }
+                    steps {
+                        echo "Triggering ${env.MONGO_QUERY_KILL_JOB}"
+                        build job: env.MONGO_QUERY_KILL_JOB,
+                            wait: true,
+                            propagate: true,
+                            parameters: [
+                                string(name: 'CORE_DATABASE_NAME', value: params.CORE_DATABASE_NAME),
+                                string(name: 'SECONDS', value: params.SECONDS),
+                                booleanParam(name: 'DRY_RUN', value: params.DRY_RUN),
+                                string(name: 'DB_NAME', value: params.DB_NAME)
+                            ]
+                    }
+                }
+
+                stage('Scaling') {
+                    when {
+                        expression {
+                            params.GCP_CELERY || params.GCP_SCALING_RH ||
+                            params.GCP_MP || params.GCP_ROLLOUT_RH
+                        }
+                    }
+                    steps {
+                        echo "Triggering ${env.SCALING_JOB} (${params.SCALE_ACTION})"
+                        // Left side = parameter names declared in the downstream scaling job
+                        // (GKE_*). Right side = this master job's GCP_* parameters.
+                        build job: env.SCALING_JOB,
+                            wait: true,
+                            propagate: true,
+                            parameters: [
+                                booleanParam(name: 'GKE_CELERY',     value: params.GCP_CELERY),
+                                booleanParam(name: 'GKE_SCALING_RH', value: params.GCP_SCALING_RH),
+                                booleanParam(name: 'GCP_MP',         value: params.GCP_MP),
+                                booleanParam(name: 'GKE_ROLLOUT_RH', value: params.GCP_ROLLOUT_RH),
+                                string(name: 'SCALE_ACTION',         value: params.SCALE_ACTION)
+                            ]
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "DONE. RUN_MONGO_QUERY_KILL=${params.RUN_MONGO_QUERY_KILL}, SCALE_ACTION=${params.SCALE_ACTION}"
+        }
+        failure {
+            echo "Master job failed - check the downstream build linked above for details."
+        }
+    }
+}

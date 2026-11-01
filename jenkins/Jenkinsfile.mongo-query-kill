@@ -1,0 +1,124 @@
+/*
+ * Mongo-Prod-Queries-Kill (downstream job)
+ * ----------------------------------------
+ * Identifies (DRY_RUN=true) or kills (DRY_RUN=false) long-running operations
+ * on the selected MongoDB cluster. Connection strings never live in code:
+ * each cluster maps to a Jenkins "Secret text" credential.
+ */
+
+pipeline {
+    agent {
+        label 'gcp-build'
+    }
+
+    options {
+        timeout(time: 15, unit: 'MINUTES')
+    }
+
+    environment {
+        SCRIPT_DIR = 'scripts/mongo'
+        KILLSCRIPT = 'kill_long_running_ops.py'
+    }
+
+    parameters {
+        choice(
+            name: 'CORE_DATABASE_NAME',
+            choices: ['MAIN', 'CHAT', 'EVENT', 'CHAT_MESSAGE'],
+            description: 'Select which MongoDB cluster to run against'
+        )
+
+        string(
+            name: 'SECONDS',
+            defaultValue: '10',
+            description: 'Kill queries running longer than this many seconds'
+        )
+
+        booleanParam(
+            name: 'DRY_RUN',
+            defaultValue: true,
+            description: 'If true, only list operations first'
+        )
+
+        string(
+            name: 'DB_NAME',
+            defaultValue: '',
+            description: 'Optional: only kill ops for this DB name'
+        )
+    }
+
+    stages {
+
+        stage('Validate & Select Mongo Credential') {
+            steps {
+                script {
+                    // Re-validate here too: this job can also be run on its own.
+                    if (!(params.SECONDS ==~ /^[1-9][0-9]*$/)) {
+                        error("SECONDS must be a positive integer, got '${params.SECONDS}'")
+                    }
+                    if (params.DB_NAME && !(params.DB_NAME ==~ /^[A-Za-z0-9_-]+$/)) {
+                        error("DB_NAME may only contain letters, digits, '_' and '-', got '${params.DB_NAME}'")
+                    }
+
+                    // Map choice -> Jenkins Credential ID (Secret text holding the URI)
+                    def mongoCredMap = [
+                        "MAIN"         : "MongoMainDB",
+                        "CHAT"         : "MongoChatDB",
+                        "EVENT"        : "MongoEventDB",
+                        "CHAT_MESSAGE" : "MongoChatMessageDB"
+                    ]
+
+                    env.MONGO_CRED_ID = mongoCredMap[params.CORE_DATABASE_NAME]
+
+                    echo "[INFO] Selected DB: ${params.CORE_DATABASE_NAME}"
+                    echo "[INFO] Using Credential ID: ${env.MONGO_CRED_ID}"
+                    echo "[INFO] Mode: ${params.DRY_RUN ? 'IDENTIFY ONLY (dry run)' : 'KILL'}"
+                }
+            }
+        }
+
+        stage('Run Mongo Kill Script') {
+            steps {
+                // The URI is handed to the script as an environment variable
+                // (MONGO_URI), not as a CLI argument, so it never shows up in
+                // the process list. Jenkins also masks it in the console log.
+                //
+                // The threshold is passed as KILL_THRESHOLD_SECS rather than
+                // SECONDS because $SECONDS is a special, self-incrementing
+                // variable in bash.
+                withCredentials([string(credentialsId: env.MONGO_CRED_ID, variable: 'MONGO_URI')]) {
+                    withEnv([
+                        "KILL_THRESHOLD_SECS=${params.SECONDS}",
+                        "KILL_DRY_RUN=${params.DRY_RUN}",
+                        "KILL_DB_FILTER=${params.DB_NAME}"
+                    ]) {
+                        sh '''#!/bin/bash
+                        set -eo pipefail
+
+                        cd "$SCRIPT_DIR"
+                        echo "[INFO] Working directory: $(pwd)"
+
+                        python3 -m venv .venv
+                        . .venv/bin/activate
+                        pip install --quiet -r requirements.txt
+
+                        echo "[INFO] Python Version: $(python3 --version)"
+
+                        ARGS=(--seconds "$KILL_THRESHOLD_SECS")
+                        [ "$KILL_DRY_RUN" = "true" ] && ARGS+=(--dry-run)
+                        [ -n "$KILL_DB_FILTER" ] && ARGS+=(--db "$KILL_DB_FILTER")
+
+                        echo "[INFO] Executing Mongo kill script..."
+                        python3 "$KILLSCRIPT" "${ARGS[@]}"
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "DONE: Mongo long-running ops job (DRY_RUN=${params.DRY_RUN})"
+        }
+    }
+}
