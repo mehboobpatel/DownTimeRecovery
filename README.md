@@ -254,15 +254,15 @@ python3 kill_long_running_ops.py --seconds 30 --db orders          # kill, one D
 
 Average Time For KillSwitch Scaling 17s
 
-![killswitchjobaveragetime ](screenshots/killswitch.png)
+![killswitchjobaveragetime ](screenshotslive/killswitch.png)
 
 Average Time For MongoQuery Killing 3s
 
-![MongoKilljob](screenshots/MongoKilljob.png)
+![MongoKilljob](screenshotslive/MongoKilljob.png)
 
 
 Average Time for Master Job 19s
-![alt text](screenshots/masterjobscreenshot.png)
+![alt text](screenshotslive/masterjobscreenshot.png)
 
 
 
